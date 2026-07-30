@@ -16,3 +16,10 @@ wheels/
 .venv
 
 .DS_Store
+
+# Company Claude Desktop mcpb config / generated bundle artifacts
+desktop-extension/company.config.json
+desktop-extension/python/
+desktop-extension/.staging/
+desktop-extension/manifest.json
+desktop-extension/server/company.json

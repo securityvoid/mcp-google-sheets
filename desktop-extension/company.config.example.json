@@ -1,0 +1,23 @@
+{
+  "extension": {
+    "name": "legacyoutcomes-google-sheets",
+    "display_name": "Google Sheets (Legacy Outcomes)",
+    "version": "1.0.6",
+    "description": "Company-configured Google Sheets MCP for Legacy Outcomes. Uses Secret Manager for the OAuth client, Application Default Credentials for @legacyoutcomes.com users, and a sharing gate so tools only work on sheets shared with the service account.",
+    "author_name": "Legacy Outcomes",
+    "author_url": "https://github.com/securityvoid/mcp-google-sheets",
+    "repository_url": "https://github.com/securityvoid/mcp-google-sheets.git",
+    "homepage": "https://github.com/securityvoid/mcp-google-sheets",
+    "documentation": "https://github.com/securityvoid/mcp-google-sheets#readme",
+    "support": "https://github.com/securityvoid/mcp-google-sheets/issues",
+    "license": "MIT"
+  },
+  "env": {
+    "CREDENTIALS_SECRET_NAME": "projects/YOUR_PROJECT/secrets/mcp-google-sheets-oauth-client/versions/latest",
+    "SERVICE_ACCOUNT_EMAIL": "mcp-google-sheets@YOUR_PROJECT.iam.gserviceaccount.com",
+    "TOKEN_PATH": "${HOME}/.config/mcp-google-sheets/token.json"
+  },
+  "git_source": "git+https://github.com/securityvoid/mcp-google-sheets.git@main",
+  "output": "dist/legacyoutcomes-google-sheets.mcpb",
+  "mcp_pin": "mcp>=1.8.0,<2"
+}

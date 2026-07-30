@@ -171,14 +171,14 @@ class GoogleSheetsIntegrationTests(unittest.TestCase):
         self.assertIn("replies", add_columns)
 
         initial_sheets = server.list_sheets(primary_id, ctx=self.ctx)
-        self.assertIn("Sheet1", initial_sheets)
+        self.assertIn("Sheet1", initial_sheets["sheets"])
 
         created_sheet = server.create_sheet(primary_id, "CreatedTab", ctx=self.ctx)
         self.assertEqual(created_sheet["title"], "CreatedTab")
 
         rename_result = server.rename_sheet(primary_id, "CreatedTab", "RenamedTab", ctx=self.ctx)
         self.assertIn("replies", rename_result)
-        self.assertIn("RenamedTab", server.list_sheets(primary_id, ctx=self.ctx))
+        self.assertIn("RenamedTab", server.list_sheets(primary_id, ctx=self.ctx)["sheets"])
 
         sheet1_id = server._get_sheet_id(self.sheets_service, primary_id, "Sheet1")
         self.assertIsNotNone(sheet1_id)
@@ -225,7 +225,7 @@ class GoogleSheetsIntegrationTests(unittest.TestCase):
             ctx=self.ctx,
         )
         self.assertIn("copy", copy_result)
-        self.assertIn("CopiedSheet", server.list_sheets(copy_target_id, ctx=self.ctx))
+        self.assertIn("CopiedSheet", server.list_sheets(copy_target_id, ctx=self.ctx)["sheets"])
 
         multi_data = server.get_multiple_sheet_data(
             [

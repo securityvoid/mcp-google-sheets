@@ -740,5 +740,79 @@ class SecretManagerCredentialFetchTests(unittest.TestCase):
         self.assertIn("/tmp/company-token.json", message)
 
 
+class LazyAuthContextTests(unittest.TestCase):
+    def test_lazy_context_does_not_auth_until_service_access(self):
+        ctx = server.SpreadsheetContext(
+            folder_id=None,
+            service_account_email="sa@example.com",
+            lazy=True,
+        )
+        with patch.object(server, "_authenticate") as authenticate, \
+             patch.object(server, "build", side_effect=["sheets-svc", "drive-svc"]) as build:
+            authenticate.return_value = SimpleNamespace(token="t")
+            sheets = ctx.sheets_service
+            drive = ctx.drive_service
+
+        self.assertEqual(sheets, "sheets-svc")
+        self.assertEqual(drive, "drive-svc")
+        authenticate.assert_called_once()
+        self.assertEqual(build.call_count, 2)
+
+    def test_eager_context_keeps_injected_services(self):
+        ctx = server.SpreadsheetContext(
+            sheets_service="sheets",
+            drive_service="drive",
+            lazy=False,
+        )
+        self.assertEqual(ctx.sheets_service, "sheets")
+        self.assertEqual(ctx.drive_service, "drive")
+
+    def test_authenticate_returns_credentials_not_context_manager(self):
+        fake_creds = SimpleNamespace(valid=True)
+        with patch.object(server, "CREDENTIALS_CONFIG", None), \
+             patch.object(server, "SERVICE_ACCOUNT_PATH", "/nonexistent-sa.json"), \
+             patch.object(server, "TOKEN_PATH", "/nonexistent-token.json"), \
+             patch.object(server, "CREDENTIALS_SECRET_NAME", None), \
+             patch.object(server, "SERVICE_ACCOUNT_EMAIL", None), \
+             patch.object(server.google.auth, "default", return_value=(fake_creds, "proj")):
+            creds = server._authenticate()
+
+        self.assertIs(creds, fake_creds)
+        self.assertNotIn("ContextManager", type(creds).__name__)
+
+
+class ListSheetsResponseTests(unittest.TestCase):
+    def test_list_sheets_returns_structured_payload(self):
+        sheets_service = RecordingSheetsService()
+        sheets_service.spreadsheets_resource.metadata = {
+            "properties": {"title": "Book"},
+            "sheets": [
+                {"properties": {"title": "Config", "sheetId": 1}},
+                {"properties": {"title": "Data", "sheetId": 2}},
+            ],
+        }
+        result = server.list_sheets(
+            "sheet-id",
+            ctx=fake_ctx(sheets_service=sheets_service),
+        )
+        self.assertEqual(result["spreadsheet_id"], "sheet-id")
+        self.assertEqual(result["sheets"], ["Config", "Data"])
+        self.assertEqual(result["count"], 2)
+
+    def test_list_sheets_single_sheet_still_returns_list(self):
+        sheets_service = RecordingSheetsService()
+        sheets_service.spreadsheets_resource.metadata = {
+            "properties": {"title": "Book"},
+            "sheets": [{"properties": {"title": "Config", "sheetId": 1}}],
+        }
+        result = server.list_sheets(
+            "sheet-id",
+            ctx=fake_ctx(sheets_service=sheets_service),
+        )
+        self.assertEqual(result["sheets"], ["Config"])
+        self.assertIsInstance(result["sheets"], list)
+        self.assertEqual(result["count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,12 +5,13 @@ A Model Context Protocol (MCP) server built with FastMCP for interacting with Go
 """
 
 import base64
+import contextlib
 import logging
 import os
 import sys
+import threading
 from typing import List, Dict, Any, Optional, Union
 import json
-from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 
@@ -89,18 +90,62 @@ def _parse_enabled_tools() -> Optional[set]:
 
 ENABLED_TOOLS = _parse_enabled_tools()
 
-@dataclass
 class SpreadsheetContext:
-    """Context for Google Spreadsheet service"""
-    sheets_service: Any
-    drive_service: Any
-    folder_id: Optional[str] = None
-    service_account_email: Optional[str] = None
-    _shared_role_cache: Dict[str, str] = None
+    """
+    Context for Google Spreadsheet services.
 
-    def __post_init__(self):
-        if self._shared_role_cache is None:
-            self._shared_role_cache = {}
+    Authentication is deferred until the first tool/resource access so MCP
+    clients (e.g. Claude Desktop) can complete the initialize handshake without
+    waiting on an interactive OAuth browser flow.
+    """
+
+    def __init__(
+        self,
+        sheets_service: Any = None,
+        drive_service: Any = None,
+        folder_id: Optional[str] = None,
+        service_account_email: Optional[str] = None,
+        *,
+        lazy: bool = False,
+    ):
+        self.folder_id = folder_id
+        self.service_account_email = service_account_email
+        self._shared_role_cache: Dict[str, str] = {}
+        self._lazy = lazy
+        self._sheets_service = sheets_service
+        self._drive_service = drive_service
+        self._auth_lock = threading.Lock()
+
+    def _ensure_services(self) -> None:
+        if self._sheets_service is not None and self._drive_service is not None:
+            return
+        if not self._lazy:
+            raise RuntimeError("Spreadsheet services were not initialized")
+        with self._auth_lock:
+            if self._sheets_service is not None and self._drive_service is not None:
+                return
+            creds = _authenticate()
+            self._sheets_service = build(
+                'sheets', 'v4', credentials=creds, cache_discovery=False
+            )
+            self._drive_service = build(
+                'drive', 'v3', credentials=creds, cache_discovery=False
+            )
+            if self.service_account_email:
+                logger.info(
+                    "Gating spreadsheet access on sharing with service account: %s",
+                    self.service_account_email,
+                )
+
+    @property
+    def sheets_service(self) -> Any:
+        self._ensure_services()
+        return self._sheets_service
+
+    @property
+    def drive_service(self) -> Any:
+        self._ensure_services()
+        return self._drive_service
 
 
 class ServiceAccountShareRequired(PermissionError):
@@ -353,15 +398,15 @@ def _fetch_oauth_client_config_from_secret_manager(secret_name: str) -> Dict[str
         raise AuthSetupError(_format_secret_manager_setup_error(secret_name, e)) from e
 
 
-@asynccontextmanager
-async def spreadsheet_lifespan(server: FastMCP) -> AsyncIterator[SpreadsheetContext]:
-    """Manage Google Spreadsheet API connection lifecycle"""
-    # Authenticate and build the service
+def _authenticate():
+    """Resolve Google credentials for Sheets/Drive (may open a browser once)."""
     creds = None
 
     if CREDENTIALS_CONFIG:
-        creds = service_account.Credentials.from_service_account_info(json.loads(base64.b64decode(CREDENTIALS_CONFIG)), scopes=SCOPES)
-    
+        creds = service_account.Credentials.from_service_account_info(
+            json.loads(base64.b64decode(CREDENTIALS_CONFIG)), scopes=SCOPES
+        )
+
     # Check for explicit service account authentication first (custom SERVICE_ACCOUNT_PATH)
     if not creds and SERVICE_ACCOUNT_PATH and os.path.exists(SERVICE_ACCOUNT_PATH):
         try:
@@ -375,14 +420,14 @@ async def spreadsheet_lifespan(server: FastMCP) -> AsyncIterator[SpreadsheetCont
         except Exception as e:
             logger.error("Error using service account authentication: %s", e)
             creds = None
-    
+
     # Fall back to OAuth flow if service account auth failed or not configured
     if not creds:
         logger.info("Trying OAuth authentication flow")
         if os.path.exists(TOKEN_PATH):
             with open(TOKEN_PATH, 'r') as token:
                 creds = Credentials.from_authorized_user_info(json.load(token), SCOPES)
-                
+
         # If credentials are not valid or don't exist, get new ones
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
@@ -402,12 +447,22 @@ async def spreadsheet_lifespan(server: FastMCP) -> AsyncIterator[SpreadsheetCont
             if not creds:
                 try:
                     if CREDENTIALS_SECRET_NAME:
-                        logger.info("Fetching OAuth client config from Secret Manager: %s", CREDENTIALS_SECRET_NAME)
-                        client_config = _fetch_oauth_client_config_from_secret_manager(CREDENTIALS_SECRET_NAME)
+                        logger.info(
+                            "Fetching OAuth client config from Secret Manager: %s",
+                            CREDENTIALS_SECRET_NAME,
+                        )
+                        client_config = _fetch_oauth_client_config_from_secret_manager(
+                            CREDENTIALS_SECRET_NAME
+                        )
                         flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
                     else:
-                        flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-                    creds = flow.run_local_server(port=0)
+                        flow = InstalledAppFlow.from_client_secrets_file(
+                            CREDENTIALS_PATH, SCOPES
+                        )
+                    # InstalledAppFlow prints the consent URL to stdout by default;
+                    # that corrupts MCP stdio transport, so keep it on stderr.
+                    with contextlib.redirect_stdout(sys.stderr):
+                        creds = flow.run_local_server(port=0)
 
                     # Save the credentials for the next run
                     with open(TOKEN_PATH, 'w') as token:
@@ -421,7 +476,7 @@ async def spreadsheet_lifespan(server: FastMCP) -> AsyncIterator[SpreadsheetCont
                     if _using_secret_manager_oauth():
                         raise AuthSetupError(_format_oauth_browser_setup_error(e)) from e
                     creds = None
-    
+
     # Try Application Default Credentials if no creds thus far
     # This will automatically check GOOGLE_APPLICATION_CREDENTIALS, gcloud auth, and metadata service
     if not creds:
@@ -437,23 +492,23 @@ async def spreadsheet_lifespan(server: FastMCP) -> AsyncIterator[SpreadsheetCont
             if CREDENTIALS_SECRET_NAME or SERVICE_ACCOUNT_EMAIL:
                 raise AuthSetupError(_format_final_auth_setup_error(str(e))) from e
             raise Exception("All authentication methods failed. Please configure credentials.")
-    
-    # Build the services
-    sheets_service = build('sheets', 'v4', credentials=creds, cache_discovery=False)
-    drive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
-    
-    # Optional gating service account: no lookups, just the env var as-is. When unset,
-    # every tool behaves exactly as it did before this feature existed.
-    if SERVICE_ACCOUNT_EMAIL:
-        logger.info("Gating spreadsheet access on sharing with service account: %s", SERVICE_ACCOUNT_EMAIL)
 
+    return creds
+
+
+@asynccontextmanager
+async def spreadsheet_lifespan(server: FastMCP) -> AsyncIterator[SpreadsheetContext]:
+    """Manage Google Spreadsheet API connection lifecycle.
+
+    Auth is lazy: MCP initialize/tools/list succeed immediately. The first real
+    Sheets/Drive call triggers credential resolution (token refresh, browser
+    OAuth, ADC, etc.).
+    """
     try:
-        # Provide the service in the context
         yield SpreadsheetContext(
-            sheets_service=sheets_service,
-            drive_service=drive_service,
             folder_id=DRIVE_FOLDER_ID if DRIVE_FOLDER_ID else None,
             service_account_email=SERVICE_ACCOUNT_EMAIL,
+            lazy=True,
         )
     finally:
         # No explicit cleanup needed for Google APIs
@@ -836,7 +891,7 @@ def add_columns(spreadsheet_id: str,
         readOnlyHint=True,
     ),
 )
-def list_sheets(spreadsheet_id: str, ctx: Context = None) -> List[str]:
+def list_sheets(spreadsheet_id: str, ctx: Context = None) -> Dict[str, Any]:
     """
     List all sheets in a Google Spreadsheet.
     
@@ -844,7 +899,7 @@ def list_sheets(spreadsheet_id: str, ctx: Context = None) -> List[str]:
         spreadsheet_id: The ID of the spreadsheet (found in the URL)
     
     Returns:
-        List of sheet names
+        Dict with spreadsheet_id, sheets (list of sheet names), and count
     """
     _require_shared(ctx, spreadsheet_id)
     sheets_service = ctx.request_context.lifespan_context.sheets_service
@@ -855,7 +910,13 @@ def list_sheets(spreadsheet_id: str, ctx: Context = None) -> List[str]:
     # Extract sheet names
     sheet_names = [sheet['properties']['title'] for sheet in spreadsheet['sheets']]
     
-    return sheet_names
+    # Return a structured object so MCP clients don't flatten a one-item list
+    # into a bare string (e.g. "Config" instead of ["Config"]).
+    return {
+        "spreadsheet_id": spreadsheet_id,
+        "sheets": sheet_names,
+        "count": len(sheet_names),
+    }
 
 
 @tool(
