@@ -24,7 +24,9 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 import google.auth
+import google.auth.exceptions
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +105,152 @@ class SpreadsheetContext:
 
 class ServiceAccountShareRequired(PermissionError):
     """Raised when a spreadsheet operation is blocked by the gating service account's sharing/role."""
+
+
+class AuthSetupError(RuntimeError):
+    """Raised when a company-configured auth path is incomplete or misconfigured.
+
+    Messages are intentionally specific so an AI assistant (or human) can tell the
+    user exactly which setup step to run next.
+    """
+
+
+def _using_secret_manager_oauth() -> bool:
+    return bool(CREDENTIALS_SECRET_NAME)
+
+
+def _http_status(exc: BaseException) -> Optional[int]:
+    if isinstance(exc, HttpError):
+        return getattr(exc.resp, "status", None)
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    return int(status) if status is not None else None
+
+
+def _format_secret_manager_setup_error(secret_name: str, exc: BaseException) -> str:
+    """Build an actionable error when CREDENTIALS_SECRET_NAME fetch fails."""
+    status = _http_status(exc)
+    exc_text = str(exc)
+    lower = exc_text.lower()
+
+    preamble = (
+        f"Company MCP setup is enabled (CREDENTIALS_SECRET_NAME={secret_name}), but the "
+        f"OAuth client config could not be loaded from Secret Manager.\n"
+        f"Underlying error: {exc_text}\n\n"
+        f"Fix this, then restart the MCP server:"
+    )
+
+    if isinstance(exc, google.auth.exceptions.DefaultCredentialsError) or (
+        "default credentials" in lower
+        or ("could not find" in lower and "credential" in lower)
+    ):
+        return (
+            f"{preamble}\n"
+            f"1. Install Google Cloud SDK (`gcloud`) if needed.\n"
+            f"2. Run: gcloud auth application-default login\n"
+            f"   Sign in with your company Workspace account (the account that has "
+            f"   Secret Manager Secret Accessor on this secret).\n"
+            f"3. Confirm ADC works: gcloud auth application-default print-access-token\n"
+            f"4. Restart Cursor / the MCP server and try again."
+        )
+
+    if status == 403 or "permission" in lower or "denied" in lower or "403" in lower:
+        return (
+            f"{preamble}\n"
+            f"1. Your Application Default Credentials identity lacks "
+            f"   secretmanager.versions.access on this secret.\n"
+            f"2. Run: gcloud auth application-default print-access-token\n"
+            f"   then check which account ADC is using (it must be in the Workspace "
+            f"   domain/group granted roles/secretmanager.secretAccessor on the secret).\n"
+            f"3. If the wrong account is active, re-run:\n"
+            f"   gcloud auth application-default login\n"
+            f"   and pick the correct company account.\n"
+            f"4. If access was just granted, wait a minute for IAM to propagate, then retry.\n"
+            f"5. Ask a GCP Owner/secretmanager.admin to confirm the IAM binding on:\n"
+            f"   {secret_name}"
+        )
+
+    if status == 404 or "not found" in lower or "404" in lower:
+        return (
+            f"{preamble}\n"
+            f"1. Verify CREDENTIALS_SECRET_NAME is the full resource name, e.g.\n"
+            f"   projects/PROJECT_ID/secrets/SECRET_ID/versions/latest\n"
+            f"2. Confirm the secret exists and has at least one enabled version.\n"
+            f"3. Confirm your gcloud/ADC project context matches the project in that name."
+        )
+
+    return (
+        f"{preamble}\n"
+        f"1. Ensure Application Default Credentials exist: "
+        f"gcloud auth application-default login\n"
+        f"2. Ensure that identity can read the secret: "
+        f"gcloud secrets versions access latest --secret=SECRET_ID --project=PROJECT_ID\n"
+        f"3. Ensure CREDENTIALS_SECRET_NAME is correct: {secret_name}\n"
+        f"4. Restart the MCP server after fixing."
+    )
+
+
+def _format_oauth_browser_setup_error(exc: BaseException) -> str:
+    """Build an actionable error when Secret Manager succeeded but browser OAuth failed."""
+    exc_text = str(exc)
+    lower = exc_text.lower()
+    token_hint = (
+        f"TOKEN_PATH is currently '{TOKEN_PATH}'. Ensure that path is writable "
+        f"(create the parent directory if needed)."
+    )
+
+    if "permission" in lower or "read-only" in lower or "errno 13" in lower or "read only" in lower:
+        return (
+            f"OAuth client config was loaded from Secret Manager, but saving the user "
+            f"token failed.\nUnderlying error: {exc_text}\n\n"
+            f"Fix this:\n"
+            f"1. {token_hint}\n"
+            f"2. Restart the MCP server and complete the browser consent again."
+        )
+
+    return (
+        f"OAuth client config was loaded from Secret Manager "
+        f"(CREDENTIALS_SECRET_NAME={CREDENTIALS_SECRET_NAME}), but the interactive "
+        f"browser consent flow failed.\nUnderlying error: {exc_text}\n\n"
+        f"Fix this:\n"
+        f"1. When the browser opens, sign in with your company Google account and click Allow.\n"
+        f"2. If no browser opened, run the MCP server from a graphical session (not headless SSH) "
+        f"   or complete consent on a machine with a browser, then copy token.json to TOKEN_PATH.\n"
+        f"3. {token_hint}\n"
+        f"4. Restart the MCP server and try again."
+    )
+
+
+def _format_final_auth_setup_error(detail: str) -> str:
+    """Final auth failure message when company env vars indicate a managed rollout."""
+    parts = [
+        "All authentication methods failed for this MCP Google Sheets server.",
+        f"Underlying detail: {detail}",
+        "",
+        "This looks like a company-managed setup. Check, in order:",
+    ]
+    step = 1
+    if CREDENTIALS_SECRET_NAME:
+        parts.append(
+            f"{step}. CREDENTIALS_SECRET_NAME is set ({CREDENTIALS_SECRET_NAME}). "
+            f"You need working Application Default Credentials that can read that secret:\n"
+            f"   gcloud auth application-default login\n"
+            f"   Then restart the MCP server so it can fetch the OAuth client and open browser consent."
+        )
+        step += 1
+        parts.append(
+            f"{step}. After Secret Manager fetch works, complete the one-time browser OAuth consent "
+            f"so a refresh token is written to TOKEN_PATH ('{TOKEN_PATH}')."
+        )
+        step += 1
+    if SERVICE_ACCOUNT_EMAIL:
+        parts.append(
+            f"{step}. SERVICE_ACCOUNT_EMAIL is set ({SERVICE_ACCOUNT_EMAIL}). "
+            f"Auth must succeed first; then each spreadsheet must be shared with that address "
+            f"(Viewer for reads, Editor for writes)."
+        )
+        step += 1
+    parts.append(f"{step}. Restart Cursor / the MCP server after fixing, then retry.")
+    return "\n".join(parts)
 
 
 # Drive permission roles, ordered from least to most access.
@@ -189,11 +337,21 @@ def _fetch_oauth_client_config_from_secret_manager(secret_name: str) -> Dict[str
     "projects/my-project/secrets/my-secret/versions/latest". Requires Application
     Default Credentials with secretmanager.versions.access on that secret.
     """
-    bootstrap_creds, _ = google.auth.default()
-    secretmanager_service = build('secretmanager', 'v1', credentials=bootstrap_creds, cache_discovery=False)
-    response = secretmanager_service.projects().secrets().versions().access(name=secret_name).execute()
-    payload_b64 = response['payload']['data']
-    return json.loads(base64.b64decode(payload_b64))
+    try:
+        bootstrap_creds, _ = google.auth.default()
+        secretmanager_service = build(
+            'secretmanager', 'v1', credentials=bootstrap_creds, cache_discovery=False
+        )
+        response = secretmanager_service.projects().secrets().versions().access(
+            name=secret_name
+        ).execute()
+        payload_b64 = response['payload']['data']
+        return json.loads(base64.b64decode(payload_b64))
+    except AuthSetupError:
+        raise
+    except Exception as e:
+        raise AuthSetupError(_format_secret_manager_setup_error(secret_name, e)) from e
+
 
 @asynccontextmanager
 async def spreadsheet_lifespan(server: FastMCP) -> AsyncIterator[SpreadsheetContext]:
@@ -255,8 +413,13 @@ async def spreadsheet_lifespan(server: FastMCP) -> AsyncIterator[SpreadsheetCont
                     with open(TOKEN_PATH, 'w') as token:
                         token.write(creds.to_json())
                     logger.info("Successfully authenticated using OAuth flow")
+                except AuthSetupError:
+                    # Company Secret Manager path: fail with the specific remediation text.
+                    raise
                 except Exception as e:
                     logger.error("Error with OAuth flow: %s", e)
+                    if _using_secret_manager_oauth():
+                        raise AuthSetupError(_format_oauth_browser_setup_error(e)) from e
                     creds = None
     
     # Try Application Default Credentials if no creds thus far
@@ -271,6 +434,8 @@ async def spreadsheet_lifespan(server: FastMCP) -> AsyncIterator[SpreadsheetCont
             logger.info("Successfully authenticated using ADC for project: %s", project)
         except Exception as e:
             logger.error("Error using Application Default Credentials: %s", e)
+            if CREDENTIALS_SECRET_NAME or SERVICE_ACCOUNT_EMAIL:
+                raise AuthSetupError(_format_final_auth_setup_error(str(e))) from e
             raise Exception("All authentication methods failed. Please configure credentials.")
     
     # Build the services

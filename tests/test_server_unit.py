@@ -696,6 +696,49 @@ class SecretManagerCredentialFetchTests(unittest.TestCase):
             "projects/p/secrets/s/versions/latest",
         )
 
+    def test_fetch_raises_auth_setup_error_with_adc_guidance(self):
+        with patch.object(
+            server.google.auth,
+            "default",
+            side_effect=server.google.auth.exceptions.DefaultCredentialsError("no ADC"),
+        ):
+            with self.assertRaises(server.AuthSetupError) as ctx:
+                server._fetch_oauth_client_config_from_secret_manager(
+                    "projects/p/secrets/s/versions/latest"
+                )
+
+        message = str(ctx.exception)
+        self.assertIn("CREDENTIALS_SECRET_NAME=projects/p/secrets/s/versions/latest", message)
+        self.assertIn("gcloud auth application-default login", message)
+
+    def test_fetch_raises_auth_setup_error_with_permission_guidance(self):
+        class FakeResp:
+            status = 403
+            reason = "Forbidden"
+
+        http_error = server.HttpError(FakeResp(), b'{"error":{"message":"Permission denied"}}')
+        with patch.object(server.google.auth, "default", return_value=(SimpleNamespace(), "project")), \
+             patch.object(server, "build", side_effect=http_error):
+            with self.assertRaises(server.AuthSetupError) as ctx:
+                server._fetch_oauth_client_config_from_secret_manager(
+                    "projects/p/secrets/s/versions/latest"
+                )
+
+        message = str(ctx.exception)
+        self.assertIn("secretmanager.versions.access", message)
+        self.assertIn("roles/secretmanager.secretAccessor", message)
+
+    def test_final_auth_message_includes_company_env_guidance(self):
+        with patch.object(server, "CREDENTIALS_SECRET_NAME", "projects/p/secrets/s/versions/latest"), \
+             patch.object(server, "SERVICE_ACCOUNT_EMAIL", "sa@example.com"), \
+             patch.object(server, "TOKEN_PATH", "/tmp/company-token.json"):
+            message = server._format_final_auth_setup_error("adc boom")
+
+        self.assertIn("CREDENTIALS_SECRET_NAME is set", message)
+        self.assertIn("gcloud auth application-default login", message)
+        self.assertIn("SERVICE_ACCOUNT_EMAIL is set (sa@example.com)", message)
+        self.assertIn("/tmp/company-token.json", message)
+
 
 if __name__ == "__main__":
     unittest.main()
