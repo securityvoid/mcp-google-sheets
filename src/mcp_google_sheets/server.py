@@ -8,6 +8,8 @@ import base64
 import contextlib
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import threading
 from typing import List, Dict, Any, Optional, Union
@@ -156,7 +158,7 @@ class AuthSetupError(RuntimeError):
     """Raised when a company-configured auth path is incomplete or misconfigured.
 
     Messages are intentionally specific so an AI assistant (or human) can tell the
-    user exactly which setup step to run next.
+    user exactly which setup step to take next.
     """
 
 
@@ -171,44 +173,106 @@ def _http_status(exc: BaseException) -> Optional[int]:
     return int(status) if status is not None else None
 
 
-def _format_secret_manager_setup_error(secret_name: str, exc: BaseException) -> str:
+def _gcloud_installed() -> bool:
+    return shutil.which("gcloud") is not None
+
+
+def _is_missing_adc_error(exc: BaseException) -> bool:
+    if isinstance(exc, google.auth.exceptions.DefaultCredentialsError):
+        return True
+    lower = str(exc).lower()
+    return "default credentials" in lower or (
+        "could not find" in lower and "credential" in lower
+    )
+
+
+def _launch_adc_login_detached() -> None:
+    """Open ADC browser login without blocking MCP stdio."""
+    subprocess.Popen(
+        ["gcloud", "auth", "application-default", "login"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _maybe_launch_adc_login(exc: BaseException) -> bool:
+    """If ADC is missing and gcloud exists, start browser login. Returns True if launched."""
+    if not _is_missing_adc_error(exc) or not _gcloud_installed():
+        return False
+    try:
+        _launch_adc_login_detached()
+        return True
+    except OSError as launch_error:
+        logger.warning("Failed to launch gcloud ADC login: %s", launch_error)
+        return False
+
+
+def _company_auth_context(secret_name: str) -> str:
+    """Short context for company Secret Manager OAuth setup (AI + user)."""
+    sdk_state = "is installed" if _gcloud_installed() else "is not installed"
+    return (
+        f"This server is configured to pull an OAuth client JSON from Secret Manager "
+        f"({secret_name}) using Application Default Credentials, then open a one-time "
+        f"browser login for Sheets/Drive consent. That browser token is used for further "
+        f"access. This relies on Google Cloud SDK (`gcloud`), which {sdk_state}."
+    )
+
+
+def _company_auth_next_steps(*, gcloud_present: bool, launched_adc_login: bool) -> str:
+    if not gcloud_present:
+        return (
+            "Google Cloud SDK must be installed. Help the user install it "
+            "(macOS: `brew install --cask gcloud-cli`; or "
+            "`curl https://sdk.cloud.google.com | bash`), then retry this call."
+        )
+    if launched_adc_login:
+        return (
+            "The browser will now open to gather Application Default Credentials. "
+            "Instruct the user to authorize the request, then retry this call. "
+            "A second browser window may open for Sheets/Drive consent — "
+            "instruct them to authorize that too."
+        )
+    return "Retry this call after the user finishes browser authorization."
+
+
+def _format_secret_manager_setup_error(
+    secret_name: str,
+    exc: BaseException,
+    *,
+    launched_adc_login: bool = False,
+) -> str:
     """Build an actionable error when CREDENTIALS_SECRET_NAME fetch fails."""
     status = _http_status(exc)
     exc_text = str(exc)
     lower = exc_text.lower()
+    gcloud_present = _gcloud_installed()
+    context = _company_auth_context(secret_name)
+
+    if _is_missing_adc_error(exc):
+        return (
+            f"{context}\n"
+            f"Underlying error: {exc_text}\n\n"
+            f"{_company_auth_next_steps(gcloud_present=gcloud_present, launched_adc_login=launched_adc_login)}"
+        )
 
     preamble = (
-        f"Company MCP setup is enabled (CREDENTIALS_SECRET_NAME={secret_name}), but the "
-        f"OAuth client config could not be loaded from Secret Manager.\n"
+        f"{context}\n"
+        f"Secret Manager fetch failed.\n"
         f"Underlying error: {exc_text}\n\n"
-        f"Fix this, then restart the MCP server:"
+        f"Fix, then retry this call:"
     )
-
-    if isinstance(exc, google.auth.exceptions.DefaultCredentialsError) or (
-        "default credentials" in lower
-        or ("could not find" in lower and "credential" in lower)
-    ):
-        return (
-            f"{preamble}\n"
-            f"1. Install Google Cloud SDK (`gcloud`) if needed.\n"
-            f"2. Run: gcloud auth application-default login\n"
-            f"   Sign in with your company Workspace account (the account that has "
-            f"   Secret Manager Secret Accessor on this secret).\n"
-            f"3. Confirm ADC works: gcloud auth application-default print-access-token\n"
-            f"4. Restart Cursor / the MCP server and try again."
-        )
 
     if status == 403 or "permission" in lower or "denied" in lower or "403" in lower:
         return (
             f"{preamble}\n"
-            f"1. Your Application Default Credentials identity lacks "
-            f"   secretmanager.versions.access on this secret.\n"
-            f"2. Run: gcloud auth application-default print-access-token\n"
-            f"   then check which account ADC is using (it must be in the Workspace "
-            f"   domain/group granted roles/secretmanager.secretAccessor on the secret).\n"
-            f"3. If the wrong account is active, re-run:\n"
-            f"   gcloud auth application-default login\n"
-            f"   and pick the correct company account.\n"
+            f"1. ADC exists, but that identity cannot read the secret "
+            f"(needs secretmanager.versions.access / roles/secretmanager.secretAccessor).\n"
+            f"2. Confirm which account ADC is using; it must be in the Workspace "
+            f"domain/group granted access on this secret.\n"
+            f"3. If the wrong account is active, re-authorize ADC with the company account "
+            f"and retry this call.\n"
             f"4. If access was just granted, wait a minute for IAM to propagate, then retry.\n"
             f"5. Ask a GCP Owner/secretmanager.admin to confirm the IAM binding on:\n"
             f"   {secret_name}"
@@ -220,17 +284,14 @@ def _format_secret_manager_setup_error(secret_name: str, exc: BaseException) -> 
             f"1. Verify CREDENTIALS_SECRET_NAME is the full resource name, e.g.\n"
             f"   projects/PROJECT_ID/secrets/SECRET_ID/versions/latest\n"
             f"2. Confirm the secret exists and has at least one enabled version.\n"
-            f"3. Confirm your gcloud/ADC project context matches the project in that name."
+            f"3. Confirm the secret project id matches the project in that name."
         )
 
     return (
         f"{preamble}\n"
-        f"1. Ensure Application Default Credentials exist: "
-        f"gcloud auth application-default login\n"
-        f"2. Ensure that identity can read the secret: "
-        f"gcloud secrets versions access latest --secret=SECRET_ID --project=PROJECT_ID\n"
-        f"3. Ensure CREDENTIALS_SECRET_NAME is correct: {secret_name}\n"
-        f"4. Restart the MCP server after fixing."
+        f"1. Confirm ADC can read the secret and CREDENTIALS_SECRET_NAME is correct: "
+        f"{secret_name}\n"
+        f"2. {_company_auth_next_steps(gcloud_present=gcloud_present, launched_adc_login=launched_adc_login)}"
     )
 
 
@@ -249,7 +310,7 @@ def _format_oauth_browser_setup_error(exc: BaseException) -> str:
             f"token failed.\nUnderlying error: {exc_text}\n\n"
             f"Fix this:\n"
             f"1. {token_hint}\n"
-            f"2. Restart the MCP server and complete the browser consent again."
+            f"2. Retry this call and complete the browser consent again."
         )
 
     return (
@@ -261,40 +322,40 @@ def _format_oauth_browser_setup_error(exc: BaseException) -> str:
         f"2. If no browser opened, run the MCP server from a graphical session (not headless SSH) "
         f"   or complete consent on a machine with a browser, then copy token.json to TOKEN_PATH.\n"
         f"3. {token_hint}\n"
-        f"4. Restart the MCP server and try again."
+        f"4. Retry this call."
     )
 
 
-def _format_final_auth_setup_error(detail: str) -> str:
+def _format_final_auth_setup_error(
+    detail: str,
+    *,
+    launched_adc_login: bool = False,
+) -> str:
     """Final auth failure message when company env vars indicate a managed rollout."""
     parts = [
-        "All authentication methods failed for this MCP Google Sheets server.",
+        "All authentication methods failed for this company-configured MCP Google Sheets server.",
         f"Underlying detail: {detail}",
         "",
-        "This looks like a company-managed setup. Check, in order:",
     ]
-    step = 1
     if CREDENTIALS_SECRET_NAME:
+        gcloud_present = _gcloud_installed()
+        parts.append(_company_auth_context(CREDENTIALS_SECRET_NAME))
+        parts.append("")
         parts.append(
-            f"{step}. CREDENTIALS_SECRET_NAME is set ({CREDENTIALS_SECRET_NAME}). "
-            f"You need working Application Default Credentials that can read that secret:\n"
-            f"   gcloud auth application-default login\n"
-            f"   Then restart the MCP server so it can fetch the OAuth client and open browser consent."
+            _company_auth_next_steps(
+                gcloud_present=gcloud_present,
+                launched_adc_login=launched_adc_login,
+            )
         )
-        step += 1
         parts.append(
-            f"{step}. After Secret Manager fetch works, complete the one-time browser OAuth consent "
-            f"so a refresh token is written to TOKEN_PATH ('{TOKEN_PATH}')."
+            f"After ADC works, browser consent writes TOKEN_PATH ('{TOKEN_PATH}')."
         )
-        step += 1
     if SERVICE_ACCOUNT_EMAIL:
         parts.append(
-            f"{step}. SERVICE_ACCOUNT_EMAIL is set ({SERVICE_ACCOUNT_EMAIL}). "
-            f"Auth must succeed first; then each spreadsheet must be shared with that address "
+            f"Then each spreadsheet must be shared with {SERVICE_ACCOUNT_EMAIL} "
             f"(Viewer for reads, Editor for writes)."
         )
-        step += 1
-    parts.append(f"{step}. Restart Cursor / the MCP server after fixing, then retry.")
+    parts.append("Retry this call after fixing.")
     return "\n".join(parts)
 
 
@@ -395,7 +456,12 @@ def _fetch_oauth_client_config_from_secret_manager(secret_name: str) -> Dict[str
     except AuthSetupError:
         raise
     except Exception as e:
-        raise AuthSetupError(_format_secret_manager_setup_error(secret_name, e)) from e
+        launched = _maybe_launch_adc_login(e)
+        raise AuthSetupError(
+            _format_secret_manager_setup_error(
+                secret_name, e, launched_adc_login=launched
+            )
+        ) from e
 
 
 def _authenticate():
@@ -490,7 +556,10 @@ def _authenticate():
         except Exception as e:
             logger.error("Error using Application Default Credentials: %s", e)
             if CREDENTIALS_SECRET_NAME or SERVICE_ACCOUNT_EMAIL:
-                raise AuthSetupError(_format_final_auth_setup_error(str(e))) from e
+                launched = _maybe_launch_adc_login(e) if CREDENTIALS_SECRET_NAME else False
+                raise AuthSetupError(
+                    _format_final_auth_setup_error(str(e), launched_adc_login=launched)
+                ) from e
             raise Exception("All authentication methods failed. Please configure credentials.")
 
     return creds

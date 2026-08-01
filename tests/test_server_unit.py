@@ -701,15 +701,37 @@ class SecretManagerCredentialFetchTests(unittest.TestCase):
             server.google.auth,
             "default",
             side_effect=server.google.auth.exceptions.DefaultCredentialsError("no ADC"),
-        ):
+        ), patch.object(server, "_gcloud_installed", return_value=False), \
+             patch.object(server, "_launch_adc_login_detached") as launch:
             with self.assertRaises(server.AuthSetupError) as ctx:
                 server._fetch_oauth_client_config_from_secret_manager(
                     "projects/p/secrets/s/versions/latest"
                 )
 
         message = str(ctx.exception)
-        self.assertIn("CREDENTIALS_SECRET_NAME=projects/p/secrets/s/versions/latest", message)
-        self.assertIn("gcloud auth application-default login", message)
+        self.assertIn("projects/p/secrets/s/versions/latest", message)
+        self.assertIn("is not installed", message)
+        self.assertIn("Google Cloud SDK must be installed", message)
+        self.assertIn("brew install --cask gcloud-cli", message)
+        launch.assert_not_called()
+
+    def test_adc_guidance_launches_login_when_gcloud_present(self):
+        with patch.object(
+            server.google.auth,
+            "default",
+            side_effect=server.google.auth.exceptions.DefaultCredentialsError("no ADC"),
+        ), patch.object(server, "_gcloud_installed", return_value=True), \
+             patch.object(server, "_launch_adc_login_detached") as launch:
+            with self.assertRaises(server.AuthSetupError) as ctx:
+                server._fetch_oauth_client_config_from_secret_manager(
+                    "projects/p/secrets/s/versions/latest"
+                )
+
+        message = str(ctx.exception)
+        self.assertIn("is installed", message)
+        self.assertIn("browser will now open", message)
+        self.assertIn("retry this call", message)
+        launch.assert_called_once()
 
     def test_fetch_raises_auth_setup_error_with_permission_guidance(self):
         class FakeResp:
@@ -718,7 +740,9 @@ class SecretManagerCredentialFetchTests(unittest.TestCase):
 
         http_error = server.HttpError(FakeResp(), b'{"error":{"message":"Permission denied"}}')
         with patch.object(server.google.auth, "default", return_value=(SimpleNamespace(), "project")), \
-             patch.object(server, "build", side_effect=http_error):
+             patch.object(server, "build", side_effect=http_error), \
+             patch.object(server, "_gcloud_installed", return_value=True), \
+             patch.object(server, "_launch_adc_login_detached") as launch:
             with self.assertRaises(server.AuthSetupError) as ctx:
                 server._fetch_oauth_client_config_from_secret_manager(
                     "projects/p/secrets/s/versions/latest"
@@ -727,17 +751,22 @@ class SecretManagerCredentialFetchTests(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("secretmanager.versions.access", message)
         self.assertIn("roles/secretmanager.secretAccessor", message)
+        launch.assert_not_called()
 
     def test_final_auth_message_includes_company_env_guidance(self):
         with patch.object(server, "CREDENTIALS_SECRET_NAME", "projects/p/secrets/s/versions/latest"), \
              patch.object(server, "SERVICE_ACCOUNT_EMAIL", "sa@example.com"), \
-             patch.object(server, "TOKEN_PATH", "/tmp/company-token.json"):
-            message = server._format_final_auth_setup_error("adc boom")
+             patch.object(server, "TOKEN_PATH", "/tmp/company-token.json"), \
+             patch.object(server, "_gcloud_installed", return_value=True):
+            message = server._format_final_auth_setup_error(
+                "adc boom", launched_adc_login=True
+            )
 
-        self.assertIn("CREDENTIALS_SECRET_NAME is set", message)
-        self.assertIn("gcloud auth application-default login", message)
-        self.assertIn("SERVICE_ACCOUNT_EMAIL is set (sa@example.com)", message)
+        self.assertIn("is installed", message)
+        self.assertIn("browser will now open", message)
+        self.assertIn("sa@example.com", message)
         self.assertIn("/tmp/company-token.json", message)
+        self.assertNotIn("Restart", message)
 
 
 class LazyAuthContextTests(unittest.TestCase):
