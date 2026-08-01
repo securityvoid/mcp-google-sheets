@@ -282,7 +282,8 @@ class ToolRequestConstructionTests(unittest.TestCase):
     def test_get_sheet_data_uses_values_api_by_default(self):
         sheets_service = RecordingSheetsService()
         values_resource = sheets_service.spreadsheets_resource.values_resource
-        values_resource.get_results["Sheet1!A1:B2"] = {"values": [["a", "b"]]}
+        values = [["a", "b"]]
+        values_resource.get_results["Sheet1!A1:B2"] = {"values": values}
 
         result = server.get_sheet_data(
             "spreadsheet-id",
@@ -291,13 +292,13 @@ class ToolRequestConstructionTests(unittest.TestCase):
             ctx=fake_ctx(sheets_service=sheets_service),
         )
 
+        self.assertEqual(result["spreadsheetId"], "spreadsheet-id")
         self.assertEqual(
-            result,
-            {
-                "spreadsheetId": "spreadsheet-id",
-                "valueRanges": [{"range": "Sheet1!A1:B2", "values": [["a", "b"]]}],
-            },
+            result["valueRanges"],
+            [{"range": "Sheet1!A1:B2", "values": values}],
         )
+        self.assertEqual(result["hash_range"], "Sheet1!A1:B2")
+        self.assertEqual(result["content_hash"], server._hash_sheet_values(values))
         self.assertEqual(
             values_resource.calls[-1],
             (
@@ -308,18 +309,30 @@ class ToolRequestConstructionTests(unittest.TestCase):
 
     def test_update_cells_uses_user_entered_values(self):
         sheets_service = RecordingSheetsService()
+        values_resource = sheets_service.spreadsheets_resource.values_resource
+        current = [["1", "2"], ["3", "4"]]
+        values_resource.get_results["Sheet1!A1:B2"] = {"values": current}
+        expected_hash = server._hash_sheet_values(current)
 
         result = server.update_cells(
             "spreadsheet-id",
             "Sheet1",
             "A1:B2",
             [[1, 2], [3, 4]],
+            expected_hash=expected_hash,
             ctx=fake_ctx(sheets_service=sheets_service),
         )
 
         self.assertEqual(result, {"updatedCells": 4})
         self.assertEqual(
-            sheets_service.spreadsheets_resource.values_resource.calls[-1],
+            values_resource.calls[0],
+            (
+                "values.get",
+                {"spreadsheetId": "spreadsheet-id", "range": "Sheet1!A1:B2"},
+            ),
+        )
+        self.assertEqual(
+            values_resource.calls[-1],
             (
                 "values.update",
                 {
@@ -610,7 +623,14 @@ class ServiceAccountGatingTests(unittest.TestCase):
                        service_account_email=self.SA_EMAIL)
 
         with self.assertRaises(server.ServiceAccountShareRequired):
-            server.update_cells("spreadsheet-id", "Sheet1", "A1:B2", [[1, 2]], ctx=ctx)
+            server.update_cells(
+                "spreadsheet-id",
+                "Sheet1",
+                "A1:B2",
+                [[1, 2]],
+                expected_hash="unused",
+                ctx=ctx,
+            )
 
     def test_create_spreadsheet_auto_shares_with_configured_service_account(self):
         drive_service = RecordingDriveService()
@@ -808,6 +828,104 @@ class LazyAuthContextTests(unittest.TestCase):
 
         self.assertIs(creds, fake_creds)
         self.assertNotIn("ContextManager", type(creds).__name__)
+
+
+class ContentHashTests(unittest.TestCase):
+    def test_hash_sheet_values_is_stable(self):
+        values = [["Ada", "42"], ["Grace", "37"]]
+        self.assertEqual(
+            server._hash_sheet_values(values),
+            server._hash_sheet_values(values),
+        )
+        self.assertNotEqual(
+            server._hash_sheet_values(values),
+            server._hash_sheet_values([["Grace", "37"], ["Ada", "42"]]),
+        )
+
+    def test_resolve_hash_full_range(self):
+        self.assertEqual(
+            server._resolve_hash_full_range("Sheet1", "A1:B2", None),
+            "Sheet1!A1:B2",
+        )
+        self.assertEqual(
+            server._resolve_hash_full_range("Sheet1", "A1:B2", "*"),
+            "Sheet1",
+        )
+        self.assertEqual(
+            server._resolve_hash_full_range("Sheet1", "A1:B2", "Sheet1"),
+            "Sheet1",
+        )
+        self.assertEqual(
+            server._resolve_hash_full_range("Sheet1", "A1:B2", "A1:Z100"),
+            "Sheet1!A1:Z100",
+        )
+
+    def test_update_cells_rejects_stale_hash(self):
+        sheets_service = RecordingSheetsService()
+        values_resource = sheets_service.spreadsheets_resource.values_resource
+        values_resource.get_results["Sheet1!A1:B2"] = {"values": [["live", "data"]]}
+
+        with self.assertRaises(server.StaleContentError) as ctx:
+            server.update_cells(
+                "spreadsheet-id",
+                "Sheet1",
+                "A1:B2",
+                [["new", "data"]],
+                expected_hash="deadbeef",
+                ctx=fake_ctx(sheets_service=sheets_service),
+            )
+
+        message = str(ctx.exception)
+        self.assertIn("Content has changed since you last looked at it", message)
+        self.assertIn("get_sheet_data", message)
+        self.assertNotIn("live data", message)
+        self.assertNotIn("[['live'", message)
+        update_calls = [c for c in values_resource.calls if c[0] == "values.update"]
+        self.assertEqual(update_calls, [])
+
+    def test_update_cells_accepts_matching_full_sheet_hash(self):
+        sheets_service = RecordingSheetsService()
+        values_resource = sheets_service.spreadsheets_resource.values_resource
+        sheet_values = [["a"], ["b"], ["c"]]
+        values_resource.get_results["Sheet1"] = {"values": sheet_values}
+        expected_hash = server._hash_sheet_values(sheet_values)
+
+        result = server.update_cells(
+            "spreadsheet-id",
+            "Sheet1",
+            "A2",
+            [["b2"]],
+            expected_hash=expected_hash,
+            hash_range="*",
+            ctx=fake_ctx(sheets_service=sheets_service),
+        )
+
+        self.assertEqual(result, {"updatedCells": 4})
+        self.assertEqual(
+            values_resource.calls[0],
+            ("values.get", {"spreadsheetId": "spreadsheet-id", "range": "Sheet1"}),
+        )
+
+    def test_batch_update_cells_defaults_to_full_sheet_hash(self):
+        sheets_service = RecordingSheetsService()
+        values_resource = sheets_service.spreadsheets_resource.values_resource
+        sheet_values = [["x"]]
+        values_resource.get_results["Sheet1"] = {"values": sheet_values}
+        expected_hash = server._hash_sheet_values(sheet_values)
+
+        result = server.batch_update_cells(
+            "spreadsheet-id",
+            "Sheet1",
+            {"A1": [["y"]]},
+            expected_hash=expected_hash,
+            ctx=fake_ctx(sheets_service=sheets_service),
+        )
+
+        self.assertEqual(result, {"totalUpdatedCells": 4})
+        self.assertEqual(
+            values_resource.calls[0],
+            ("values.get", {"spreadsheetId": "spreadsheet-id", "range": "Sheet1"}),
+        )
 
 
 class ListSheetsResponseTests(unittest.TestCase):

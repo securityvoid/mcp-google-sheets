@@ -92,6 +92,7 @@ You're ready! Start issuing commands via your MCP client.
 *   **Seamless Integration:** Connects directly to Google Drive & Google Sheets APIs.
 *   **Comprehensive Tools:** Offers a wide range of operations (CRUD, listing, batching, sharing, formatting, etc.).
 *   **Flexible Authentication:** Supports **Service Accounts (recommended)**, OAuth 2.0, and direct credential injection via environment variables.
+*   **Optimistic concurrency:** `get_sheet_data` returns a small `content_hash`; value writes require it so stale edits fail if the sheet changed (e.g. after a sort or row drag).
 *   **Easy Deployment:** Run instantly with `uvx` (zero-install feel) or clone for development using `uv`.
 *   **AI-Ready:** Designed for use with MCP-compatible clients, enabling natural language spreadsheet interaction.
 *   **Tool Filtering:** Reduce context window usage by enabling only the tools you need with `--include-tools` or `ENABLED_TOOLS` environment variable.
@@ -198,7 +199,7 @@ _Refer to the [ID Reference Guide](#-id-reference-guide) for more information ab
     *   `sheet` (string): Name of the sheet/tab (e.g., "Sheet1").
     *   `range` (optional string): A1 notation (e.g., `'A1:C10'`, `'Sheet1!B2:D'`). If omitted, reads the whole sheet/tab specified by `sheet`.
     *   `include_grid_data` (optional boolean, default `False`): If `True`, returns full grid data including formatting and metadata (much larger). If `False`, returns values only (more efficient).
-    *   _Returns:_ If `include_grid_data=True`, full grid data with metadata ([`get` response](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets/get#response-body)). If `False`, a values result object from the Values API ([`values.get` response](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values/get#response-body)).
+    *   _Returns:_ Values (or full grid data) plus `content_hash` (SHA-256 of the returned values) and `hash_range` (the scope that hash covers). Pass both into `update_cells` / `batch_update_cells` on later writes. See [Optimistic Concurrency](#-optimistic-concurrency-content-hash).
 *   **`get_sheet_formulas`**: Reads formulas from a range in a sheet/tab.
     *   `spreadsheet_id` (string): The spreadsheet ID (from its URL).
     *   `sheet` (string): Name of the sheet/tab (e.g., "Sheet1").
@@ -209,12 +210,18 @@ _Refer to the [ID Reference Guide](#-id-reference-guide) for more information ab
     *   `sheet` (string): Name of the sheet/tab (e.g., "Sheet1").
     *   `range` (string): A1 notation range to write to (e.g., 'A1:C3').
     *   `data` (array of arrays): 2D array of values to write. Example: `[[1, 2, 3], ["a", "b", "c"]]`.
+    *   `expected_hash` (string): `content_hash` from your last `get_sheet_data` for this scope. **Required.**
+    *   `hash_range` (optional string): Scope that `expected_hash` covers. Defaults to the write `range`. Prefer the `hash_range` from `get_sheet_data`. Use `'*'` or the sheet name for a full-sheet read.
     *   _Returns:_ Update result object ([`values.update` response](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values/update#response-body)).
+    *   _Errors:_ If live content no longer matches `expected_hash`, raises a stale-content error — re-read with `get_sheet_data` and retry (no cell values are included in the error).
 *   **`batch_update_cells`**: Updates multiple ranges in one API call.
     *   `spreadsheet_id` (string): The spreadsheet ID (from its URL).
     *   `sheet` (string): Name of the sheet/tab (e.g., "Sheet1").
     *   `ranges` (object): Dictionary mapping range strings (A1 notation) to 2D arrays of values. Example: `{ "A1:B2": [[1, 2], [3, 4]], "D5": [["Hello"]] }`.
+    *   `expected_hash` (string): `content_hash` from your last `get_sheet_data` for `hash_range`. **Required.**
+    *   `hash_range` (optional string, default `'*'`): Scope that `expected_hash` covers (entire sheet by default). Pass `hash_range` from `get_sheet_data` when possible.
     *   _Returns:_ Result of the operation ([`values.batchUpdate` response](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values/batchUpdate#response-body)).
+    *   _Errors:_ Same stale-content behavior as `update_cells`.
 *   **`add_rows`**: Adds (inserts) empty rows to a sheet/tab at a specified index.
     *   `spreadsheet_id` (string): The spreadsheet ID (from its URL).
     *   `sheet` (string): Name of the sheet/tab (e.g., "Sheet1").
@@ -377,7 +384,7 @@ If you'd rather not embed that file in your distribution process, see **Fetching
 ### Method E: Fetching the OAuth Client Config from Secret Manager 🔐
 
 *   **Why?** For rolling out Method B (OAuth) to multiple machines (e.g. everyone at a company) without embedding the OAuth Client ID JSON in your software distribution/config-management pipeline. Instead, the server fetches it from Google Secret Manager at startup.
-*   **How it works:** Requires the machine to already have *some* Application Default Credentials available (e.g. via `gcloud auth application-default login`, run once) with permission to read the secret. Using that bootstrap identity, the server fetches the OAuth Client ID JSON from Secret Manager and uses it to run the normal Method B browser-consent flow - each user still gets their own local `token.json` afterwards, same as Method B.
+*   **How it works:** Requires Application Default Credentials with permission to read the secret. When `CREDENTIALS_SECRET_NAME` is set and ADC is missing, the server detects whether `gcloud` is installed: if yes, it launches `gcloud auth application-default login` in the background (browser consent) and returns guidance to authorize then retry; if not, it returns install guidance (e.g. Homebrew/`curl` installer) then retry. After ADC can read the secret, the normal Method B browser-consent flow runs for Sheets/Drive — each user gets their own local `token.json`.
 *   **One-time setup (in your GCP project):**
     1.  Enable the API: `gcloud services enable secretmanager.googleapis.com`
     2.  Create the secret: `gcloud secrets create mcp-google-sheets-oauth-client --replication-policy=automatic`
@@ -385,7 +392,7 @@ If you'd rather not embed that file in your distribution process, see **Fetching
     4.  Grant read access to whoever should be able to fetch it, e.g. for everyone in a Workspace domain: `gcloud secrets add-iam-policy-binding mcp-google-sheets-oauth-client --member="domain:yourcompany.com" --role="roles/secretmanager.secretAccessor"`
 *   **Set the Environment Variable:**
     *   `CREDENTIALS_SECRET_NAME`: Full resource name of the secret version, e.g. `projects/my-project/secrets/mcp-google-sheets-oauth-client/versions/latest`. Takes priority over `CREDENTIALS_PATH` when set.
-*   **Caveat:** This doesn't eliminate the need for a bootstrap GCP login on each machine - it narrows what that login is used for (reading one secret, read-only) compared to using ADC directly for Sheets/Drive access.
+*   **Caveat:** Google Cloud SDK (`gcloud`) is still needed once per machine for the ADC bootstrap. Password/account consent happens in the browser; after ADC works, retry the tool call (no MCP restart required).
 
 ### Authentication Priority & Summary
 
@@ -425,6 +432,21 @@ If you authenticate as an end user (OAuth or `gcloud auth application-default lo
 *   **Leave `SERVICE_ACCOUNT_EMAIL` unset and none of this applies** - every tool behaves exactly as it did before this feature existed, with no extra API calls or restrictions.
 
 This is an app-level allowlist, not a Google-enforced ACL boundary - it's enforced by this server's code, not by Google's permission system, so it's a defense-in-depth measure rather than a hard security boundary. It's most useful for keeping an AI tool scoped to a known set of sheets even though the underlying credentials could technically reach more.
+
+---
+
+## 🔐 Optimistic Concurrency (Content Hash)
+
+Row order and cell contents can change between an AI read and a later write (manual sort, drag-reorder, another editor). Value writes therefore use a small content hash so the server can reject stale edits instead of writing to the wrong rows.
+
+**How it works:**
+
+1.  `get_sheet_data` returns `content_hash` (SHA-256 of the values) and `hash_range` (the A1 scope hashed). Context cost is tiny (~64 hex characters).
+2.  `update_cells` / `batch_update_cells` require `expected_hash`. Before writing, the server re-reads that scope and compares hashes.
+3.  On mismatch, the write fails with a short message: content changed — call `get_sheet_data` again and retry. The error does **not** dump cell values (keeps context small).
+4.  Pass `hash_range` from the read when possible. For `update_cells`, omitting it verifies the write `range`. For `batch_update_cells`, the default is `'*'` (entire sheet). Use `'*'` or the sheet name after a full-sheet read.
+
+This is app-level optimistic locking, not a Google Sheets etag/`If-Match` feature.
 
 ---
 

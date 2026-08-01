@@ -17,6 +17,9 @@ wheels/
 
 .DS_Store
 
+# Local Cursor MCP / IDE config (machine-specific paths)
+.cursor/
+
 # Company Claude Desktop mcpb config / generated bundle artifacts
 desktop-extension/company.config.json
 desktop-extension/python/

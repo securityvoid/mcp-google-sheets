@@ -6,6 +6,7 @@ A Model Context Protocol (MCP) server built with FastMCP for interacting with Go
 
 import base64
 import contextlib
+import hashlib
 import logging
 import os
 import shutil
@@ -152,6 +153,10 @@ class SpreadsheetContext:
 
 class ServiceAccountShareRequired(PermissionError):
     """Raised when a spreadsheet operation is blocked by the gating service account's sharing/role."""
+
+
+class StaleContentError(RuntimeError):
+    """Raised when a write's expected content hash does not match the live sheet."""
 
 
 class AuthSetupError(RuntimeError):
@@ -431,9 +436,59 @@ def _require_shared(ctx: Context, spreadsheet_id: str, write: bool = False) -> N
     _verify_shared_with_service_account(ctx.request_context.lifespan_context, spreadsheet_id, write=write)
 
 
+def _hash_sheet_values(values: Optional[List[List[Any]]]) -> str:
+    """Stable SHA-256 of a Sheets values 2D array (small; safe to put in tool responses)."""
+    payload = json.dumps(values or [], ensure_ascii=False, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _resolve_hash_full_range(sheet: str, write_range: Optional[str], hash_range: Optional[str]) -> str:
+    """Build the A1 range used for optimistic-concurrency hashing.
 
+    - hash_range None → write_range on this sheet (or whole sheet if write_range is None)
+    - hash_range '*', '', or the sheet name → entire sheet
+    - otherwise → sheet!hash_range (or hash_range if already qualified)
+    """
+    if hash_range is None:
+        if write_range:
+            return f"{sheet}!{write_range}"
+        return sheet
+    if hash_range in ("*", "", sheet):
+        return sheet
+    if "!" in hash_range:
+        return hash_range
+    return f"{sheet}!{hash_range}"
+
+
+def _fetch_sheet_values(sheets_service: Any, spreadsheet_id: str, full_range: str) -> List[List[Any]]:
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=full_range,
+    ).execute()
+    return result.get("values", [])
+
+
+def _require_content_hash(
+    sheets_service: Any,
+    spreadsheet_id: str,
+    full_range: str,
+    expected_hash: str,
+) -> str:
+    """Re-read full_range and ensure its content hash matches expected_hash.
+
+    Returns the live hash on success. Raises StaleContentError on mismatch (no values
+    in the error message — caller should re-read via get_sheet_data).
+    """
+    live_values = _fetch_sheet_values(sheets_service, spreadsheet_id, full_range)
+    live_hash = _hash_sheet_values(live_values)
+    if live_hash != expected_hash:
+        raise StaleContentError(
+            f"Content has changed since you last looked at it "
+            f"(hash_range='{full_range}'). Call get_sheet_data again for this "
+            f"scope and retry the edit with the new content_hash. "
+            f"expected_hash={expected_hash}, live_hash={live_hash}."
+        )
+    return live_hash
 def _fetch_oauth_client_config_from_secret_manager(secret_name: str) -> Dict[str, Any]:
     """
     Fetch an OAuth Desktop-app client config (the contents of a credentials.json file)
@@ -656,7 +711,8 @@ def get_sheet_data(spreadsheet_id: str,
             Default is False (returns values only, more efficient).
     
     Returns:
-        Grid data structure with either full metadata or just values from Google Sheets API, depending on include_grid_data parameter
+        Grid/values payload plus content_hash and hash_range. Pass those into update_cells /
+        batch_update_cells as expected_hash / hash_range so edits fail if the sheet changed.
     """
     _require_shared(ctx, spreadsheet_id)
     sheets_service = ctx.request_context.lifespan_context.sheets_service
@@ -666,6 +722,10 @@ def get_sheet_data(spreadsheet_id: str,
         full_range = f"{sheet}!{range}"
     else:
         full_range = sheet
+
+    # Always load values for a stable content_hash (small; used by write optimistic locking).
+    values = _fetch_sheet_values(sheets_service, spreadsheet_id, full_range)
+    content_hash = _hash_sheet_values(values)
     
     if include_grid_data:
         # Use full API to get all grid data including formatting
@@ -674,23 +734,19 @@ def get_sheet_data(spreadsheet_id: str,
             ranges=[full_range],
             includeGridData=True
         ).execute()
-    else:
-        # Use values API to get cell values only (more efficient)
-        values_result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range=full_range
-        ).execute()
-        
-        # Format the response to match expected structure
-        result = {
-            'spreadsheetId': spreadsheet_id,
-            'valueRanges': [{
-                'range': full_range,
-                'values': values_result.get('values', [])
-            }]
-        }
+        result['content_hash'] = content_hash
+        result['hash_range'] = full_range
+        return result
 
-    return result
+    return {
+        'spreadsheetId': spreadsheet_id,
+        'valueRanges': [{
+            'range': full_range,
+            'values': values
+        }],
+        'content_hash': content_hash,
+        'hash_range': full_range,
+    }
 
 @tool(
     annotations=ToolAnnotations(
@@ -743,6 +799,8 @@ def update_cells(spreadsheet_id: str,
                 sheet: str,
                 range: str,
                 data: List[List[Any]],
+                expected_hash: str,
+                hash_range: Optional[str] = None,
                 ctx: Context = None) -> Dict[str, Any]:
     """
     Update cells in a Google Spreadsheet.
@@ -752,12 +810,22 @@ def update_cells(spreadsheet_id: str,
         sheet: The name of the sheet
         range: Cell range in A1 notation (e.g., 'A1:C10')
         data: 2D array of values to update
+        expected_hash: content_hash from your last get_sheet_data for this scope
+        hash_range: Scope that expected_hash covers. Defaults to the write `range`. Pass
+            hash_range from get_sheet_data when possible. Use '*' or the sheet name for a
+            full-sheet read.
     
     Returns:
         Result of the update operation
+    
+    Raises:
+        StaleContentError: Live sheet content no longer matches expected_hash — re-read first.
     """
     _require_shared(ctx, spreadsheet_id, write=True)
     sheets_service = ctx.request_context.lifespan_context.sheets_service
+
+    verify_range = _resolve_hash_full_range(sheet, range, hash_range)
+    _require_content_hash(sheets_service, spreadsheet_id, verify_range, expected_hash)
     
     # Construct the range
     full_range = f"{sheet}!{range}"
@@ -787,6 +855,8 @@ def update_cells(spreadsheet_id: str,
 def batch_update_cells(spreadsheet_id: str,
                        sheet: str,
                        ranges: Dict[str, List[List[Any]]],
+                       expected_hash: str,
+                       hash_range: Optional[str] = "*",
                        ctx: Context = None) -> Dict[str, Any]:
     """
     Batch update multiple ranges in a Google Spreadsheet.
@@ -796,12 +866,21 @@ def batch_update_cells(spreadsheet_id: str,
         sheet: The name of the sheet
         ranges: Dictionary mapping range strings to 2D arrays of values
                e.g., {'A1:B2': [[1, 2], [3, 4]], 'D1:E2': [['a', 'b'], ['c', 'd']]}
+        expected_hash: content_hash from your last get_sheet_data for hash_range
+        hash_range: Scope that expected_hash covers. Defaults to '*' (entire sheet).
+            Pass hash_range from your last get_sheet_data when possible.
     
     Returns:
         Result of the batch update operation
+    
+    Raises:
+        StaleContentError: Live sheet content no longer matches expected_hash — re-read first.
     """
     _require_shared(ctx, spreadsheet_id, write=True)
     sheets_service = ctx.request_context.lifespan_context.sheets_service
+
+    verify_range = _resolve_hash_full_range(sheet, None, hash_range)
+    _require_content_hash(sheets_service, spreadsheet_id, verify_range, expected_hash)
     
     # Prepare the batch update request
     data = []

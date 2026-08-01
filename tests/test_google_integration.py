@@ -133,6 +133,9 @@ class GoogleSheetsIntegrationTests(unittest.TestCase):
         primary_id = self.create_test_spreadsheet(primary_title)
         copy_target_id = self.create_test_spreadsheet(copy_target_title)
 
+        # Bootstrap cells without hash gate by writing through the values API mock path:
+        # integration uses a real API — seed via update after an empty-range read hash.
+        empty = server.get_sheet_data(primary_id, "Sheet1", "A1:D3", ctx=self.ctx)
         update_result = server.update_cells(
             primary_id,
             "Sheet1",
@@ -142,6 +145,8 @@ class GoogleSheetsIntegrationTests(unittest.TestCase):
                 ["Ada", 42, "alpha", "=B2*2"],
                 ["Grace", 37, "beta", "=B3*2"],
             ],
+            expected_hash=empty["content_hash"],
+            hash_range=empty["hash_range"],
             ctx=self.ctx,
         )
         self.assertGreaterEqual(update_result.get("updatedCells", 0), 12)
@@ -149,6 +154,8 @@ class GoogleSheetsIntegrationTests(unittest.TestCase):
         data = server.get_sheet_data(primary_id, "Sheet1", "A1:D3", ctx=self.ctx)
         self.assertEqual(data["valueRanges"][0]["values"][1][0], "Ada")
         self.assertEqual(data["valueRanges"][0]["values"][1][1], "42")
+        self.assertIn("content_hash", data)
+        self.assertEqual(data["hash_range"], f"Sheet1!A1:D3")
 
         formulas = server.get_sheet_formulas(primary_id, "Sheet1", "D2:D3", ctx=self.ctx)
         self.assertEqual(formulas, [["=B2*2"], ["=B3*2"]])
@@ -160,6 +167,8 @@ class GoogleSheetsIntegrationTests(unittest.TestCase):
                 "E1:E2": [["status"], ["ready"]],
                 "F1:F2": [["owner"], ["integration"]],
             },
+            expected_hash=data["content_hash"],
+            hash_range=data["hash_range"],
             ctx=self.ctx,
         )
         self.assertGreaterEqual(batch_cells.get("totalUpdatedCells", 0), 4)
